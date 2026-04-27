@@ -1,319 +1,255 @@
-import os
+#!/usr/bin/env python3
+"""Distance-vector helper for Docker eval (compact variant of router.py logic)."""
+
 import json
+import os
 import socket
-import time
-import threading
 import subprocess
+import threading
+import time
 
-# ==========================================
-# Configuration
-# ==========================================
-router_identity_ip = os.getenv("MY_IP", "127.0.0.1")
-direct_network_entries = os.getenv("DIRECT_NETWORKS", "").split(",")
-neighbor_ip_addresses = os.getenv("NEIGHBORS", "").split(",")
+host_v4 = os.getenv("MY_IP", "127.0.0.1")
+env_static_prefixes = os.getenv("DIRECT_NETWORKS", "").split(",")
+adjacent_hosts = os.getenv("NEIGHBORS", "").split(",")
 
-udp_port_number = 5000
-route_timeout_limit = 15
-update_interval_seconds = 5
+svc_udp = 5000
+hold_ttl_s = 15
+beacon_s = 1
+BAD_METRIC = 16
 
-# subnet -> [distance_metric, next_hop_ip, last_update_timestamp]
-routing_information_table = {}
+# prefix -> [cost, gw_ip, touched_at]
+topo_map = {}
+mtx_topo = threading.Lock()
+mtx_rtab = threading.Lock()
+linux_added = set()
 
-# Lock protecting all reads and writes to routing_information_table.
-table_lock = threading.Lock()
+sk_tx = None
+mtx_tx = threading.Lock()
+past_setup = False
+drip_bad = {}
 
+def ip_argv(parts):
+    return subprocess.run(["ip", *parts], capture_output=True, text=True, check=False)
 
-# ==========================================
-# Kernel Route Management
-# Evaluator checks `ip route show table main` — not our Python dict.
-# Every learned route must be written into the kernel table so the
-# evaluator can see it.
-# ==========================================
-def kernel_add_route(subnet, via_ip):
-    """Install a learned route into the kernel routing table."""
-    try:
-        subprocess.run(
-            ["ip", "route", "replace", subnet, "via", via_ip],
-            capture_output=True, check=False
-        )
-    except Exception as e:
-        print(f"[WARN] Could not add kernel route {subnet} via {via_ip}: {e}")
+def count_adjacent():
+    return len([x for x in adjacent_hosts if x.strip()])
 
+def kernel_link_prefixes():
+    got = set()
+    res = ip_argv(["route", "show", "table", "main"])
+    if res.returncode != 0 or not res.stdout:
+        return got
+    for ln in res.stdout.strip().split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        if "proto kernel" in ln and "scope link" in ln:
+            tok = ln.split()[0]
+            if "/" in tok and tok.startswith("10."):
+                got.add(tok)
+    return got
 
-def kernel_del_route(subnet):
-    """Remove an expired learned route from the kernel routing table."""
-    try:
-        subprocess.run(
-            ["ip", "route", "del", subnet],
-            capture_output=True, check=False
-        )
-    except Exception as e:
-        print(f"[WARN] Could not del kernel route {subnet}: {e}")
+def bootstrap_prefixes():
+    ts = time.time()
+    with mtx_topo:
+        for chunk in env_static_prefixes:
+            p = chunk.strip()
+            if p:
+                topo_map[p] = [0, host_v4, ts]
+        for p in kernel_link_prefixes():
+            topo_map[p] = [0, host_v4, ts]
 
+def rescan_links():
+    ts = time.time()
+    dirty = False
+    with mtx_topo:
+        for p in kernel_link_prefixes():
+            row = topo_map.get(p)
+            if row is None or row[0] != 0:
+                topo_map[p] = [0, host_v4, ts]
+                dirty = True
+            else:
+                topo_map[p][2] = ts
+    if dirty:
+        trace_topo()
+        mirror_linux_routes()
+        flood_peers(advance_poison=False)
 
-# ==========================================
-# Auto-Detect Directly Connected Subnets
-# ==========================================
-def discover_connected_subnets():
-    """
-    Read directly connected subnets from the kernel routing table.
-    Replaces the DIRECT_NETWORKS env-var approach: works correctly
-    when the evaluator omits that variable.
-    """
-    detected = set()
-    try:
-        result = subprocess.run(
-            ["ip", "route", "show", "table", "main"],
-            capture_output=True, text=True
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            # Kernel-injected directly-connected routes look like:
-            #   10.0.1.0/24 dev eth0 proto kernel scope link src 10.0.1.10
-            if "proto kernel" in line and "scope link" in line:
-                parts = line.split()
-                if parts and "/" in parts[0]:
-                    detected.add(parts[0])
-    except Exception as e:
-        print(f"[WARN] Could not auto-detect subnets: {e}")
-    return detected
+def mirror_linux_routes():
+    global past_setup
+    direct = kernel_link_prefixes()
+    if len(direct) >= count_adjacent():
+        past_setup = True
+    with mtx_topo:
+        want = {}
+        for pfx, (cost, gw, _) in topo_map.items():
+            if pfx in direct:
+                continue
+            if cost > 0 and gw:
+                want[pfx] = gw
 
+    with mtx_rtab:
+        for pfx in list(linux_added):
+            if pfx not in want:
+                ip_argv(["route", "del", pfx])
+                linux_added.discard(pfx)
+        if not past_setup and len(direct) < count_adjacent():
+            return
+        for pfx, gw in want.items():
+            if ip_argv(["route", "replace", pfx, "via", gw]).returncode == 0:
+                linux_added.add(pfx)
 
-def load_direct_routes():
-    """
-    Populate routing_information_table with all directly connected subnets.
-    Merges DIRECT_NETWORKS env var (backward-compat) + kernel auto-detection.
-    Direct routes are cost=0 and do NOT need a kernel route add — Docker
-    already injected them.
-    """
-    all_subnets = set()
-
-    for network_entry in direct_network_entries:
-        cleaned = network_entry.strip()
-        if cleaned:
-            all_subnets.add(cleaned)
-
-    all_subnets |= discover_connected_subnets()
-
-    with table_lock:
-        for subnet in all_subnets:
-            routing_information_table[subnet] = [0, router_identity_ip, time.time()]
-            print(f"[DIRECT] {subnet} (cost 0, self)")
-
-
-load_direct_routes()
-
-
-# ==========================================
-# Pretty Print Routing Table
-# ==========================================
-def show_current_routing_table():
+def trace_topo():
     print("\n========== ROUTING TABLE ==========")
-    print(f"Router: {router_identity_ip}")
+    print(f"Router: {host_v4}")
     print("----------------------------------")
-    with table_lock:
-        snapshot = dict(routing_information_table)
-    for subnet_value, route_info in snapshot.items():
-        print(
-            f"{subnet_value:18} | "
-            f"cost={route_info[0]:<2} | "
-            f"via={route_info[1]}"
-        )
+    with mtx_topo:
+        snap = list(topo_map.items())
+    for pfx, row in snap:
+        print(f"{pfx:18} | cost={row[0]:<2} | via={row[1]}")
     print("==================================\n")
 
+def build_tlv(peer_ip):
+    rows = []
+    with mtx_topo:
+        body = list(topo_map.items())
+        for k in list(drip_bad.keys()):
+            if k in topo_map:
+                del drip_bad[k]
+        flash = list(drip_bad.keys())
+    for pfx, row in body:
+        cost, via, _ = row
+        dist = BAD_METRIC if (cost != 0 and via == peer_ip) else cost
+        rows.append({"subnet": pfx, "distance": dist})
+    for pfx in flash:
+        rows.append({"subnet": pfx, "distance": BAD_METRIC})
+    return json.dumps({"router_id": host_v4, "version": 1.0, "routes": rows})
 
-# ==========================================
-# Build DV Packet (Split Horizon)
-# ==========================================
-def construct_update_message(target_neighbor):
-    route_entries = []
-    with table_lock:
-        snapshot = dict(routing_information_table)
-    for subnet_value, route_info in snapshot.items():
-        distance_metric = route_info[0]
-        learned_next_hop = route_info[1]
-        # Split Horizon: do not advertise a route back to the neighbor
-        # it was learned from (loop prevention)
-        if distance_metric != 0 and learned_next_hop == target_neighbor:
-            continue
-        route_entries.append({"subnet": subnet_value, "distance": distance_metric})
-    return json.dumps({
-        "router_id": router_identity_ip,
-        "version": 1.0,
-        "routes": route_entries
-    })
-
-
-# ==========================================
-# Send Periodic Updates
-# ==========================================
-def periodic_update_sender():
-    udp_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    while True:
-        # Re-scan interfaces so recovered links are re-advertised automatically
-        refresh_direct_routes()
-
-        for neighbor_ip in neighbor_ip_addresses:
-            neighbor_ip = neighbor_ip.strip()
-            if not neighbor_ip:
+def flood_peers(advance_poison=True):
+    global sk_tx
+    if sk_tx is None:
+        return
+    with mtx_tx:
+        for raw in adjacent_hosts:
+            dst = raw.strip()
+            if not dst:
                 continue
             try:
-                packet_bytes = construct_update_message(neighbor_ip).encode()
-                udp_sender.sendto(packet_bytes, (neighbor_ip, udp_port_number))
-            except Exception as send_issue:
-                print(f"[ERROR] Could not send to {neighbor_ip}: {send_issue}")
+                sk_tx.sendto(build_tlv(dst).encode(), (dst, svc_udp))
+            except OSError as err:
+                print(f"[ERROR] Could not send to {dst}: {err}")
+    if advance_poison:
+        with mtx_topo:
+            for k in list(drip_bad.keys()):
+                drip_bad[k] -= 1
+                if drip_bad[k] <= 0:
+                    del drip_bad[k]
 
-        time.sleep(update_interval_seconds)
+def beacon_loop():
+    while True:
+        rescan_links()
+        flood_peers()
+        time.sleep(beacon_s)
 
+def _best_per_pfx(rows):
+    best = {}
+    for item in rows:
+        pfx = item.get("subnet")
+        dist = item.get("distance")
+        if pfx is None or dist is None:
+            continue
+        prev = best.get(pfx)
+        if prev is None or dist < prev:
+            best[pfx] = dist
+    return best
 
-def refresh_direct_routes():
-    """
-    Re-scan interfaces and add any newly appeared directly connected subnets.
-    Also refreshes timestamps of existing direct routes so they never expire.
-    """
-    current_time = time.time()
-    with table_lock:
-        for subnet in discover_connected_subnets():
-            if subnet not in routing_information_table:
-                routing_information_table[subnet] = [0, router_identity_ip, current_time]
-                print(f"[DIRECT-NEW] {subnet} (cost 0, self)")
-            elif routing_information_table[subnet][0] == 0:
-                routing_information_table[subnet][2] = current_time
-
-
-# ==========================================
-# Bellman-Ford Update Logic
-# ==========================================
-def process_incoming_routes(source_ip, incoming_routes):
-    table_updated = False
-    current_timestamp = time.time()
-    routes_to_add_to_kernel = []   # (subnet, via_ip) pairs
-
-    with table_lock:
-        for route_item in incoming_routes:
-            subnet_value = route_item.get("subnet")
-            received_distance = route_item.get("distance")
-
-            if subnet_value is None or received_distance is None:
+def ingest_tlv(src_ip, rows):
+    dirty = False
+    now = time.time()
+    for pfx, dist in _best_per_pfx(rows).items():
+        if dist >= BAD_METRIC:
+            with mtx_topo:
+                if pfx in topo_map and topo_map[pfx][0] > 0 and topo_map[pfx][1] == src_ip:
+                    del topo_map[pfx]
+                    dirty = True
+            continue
+        cand = dist + 1
+        if cand >= BAD_METRIC:
+            with mtx_topo:
+                if pfx in topo_map and topo_map[pfx][0] > 0 and topo_map[pfx][1] == src_ip:
+                    del topo_map[pfx]
+                    dirty = True
+            continue
+        with mtx_topo:
+            if pfx in topo_map and topo_map[pfx][0] == 0:
                 continue
-
-            computed_distance = received_distance + 1
-
-            # Protect directly connected routes
-            if (
-                subnet_value in routing_information_table and
-                routing_information_table[subnet_value][0] == 0
-            ):
-                continue
-
-            if subnet_value not in routing_information_table:
-                # New route discovered
-                routing_information_table[subnet_value] = [
-                    computed_distance, source_ip, current_timestamp
-                ]
-                routes_to_add_to_kernel.append((subnet_value, source_ip))
-                print(f"[ADD] {subnet_value} via {source_ip} (cost {computed_distance})")
-                table_updated = True
-
+            if pfx not in topo_map:
+                topo_map[pfx] = [cand, src_ip, now]
+                print(f"[ADD] {pfx} via {src_ip} (cost {cand})")
+                dirty = True
             else:
-                existing_distance = routing_information_table[subnet_value][0]
-                existing_next_hop = routing_information_table[subnet_value][1]
+                old_c, old_gw, _ = topo_map[pfx]
+                if cand < old_c:
+                    topo_map[pfx] = [cand, src_ip, now]
+                    print(f"[UPDATE] {pfx} via {src_ip} (cost {cand})")
+                    dirty = True
+                elif old_gw == src_ip:
+                    topo_map[pfx][0] = cand
+                    topo_map[pfx][2] = now
+                    dirty = True
+    if dirty:
+        trace_topo()
+        mirror_linux_routes()
+        flood_peers(advance_poison=False)
 
-                if computed_distance < existing_distance:
-                    # Better route found — take it
-                    routing_information_table[subnet_value] = [
-                        computed_distance, source_ip, current_timestamp
-                    ]
-                    routes_to_add_to_kernel.append((subnet_value, source_ip))
-                    print(f"[UPDATE] {subnet_value} via {source_ip} (cost {computed_distance})")
-                    table_updated = True
-
-                elif existing_next_hop == source_ip:
-                    # Same next-hop keep-alive: refresh timestamp only
-                    routing_information_table[subnet_value][2] = current_timestamp
-
-                # NOTE: if a DIFFERENT neighbor advertises the same cost we do
-                # NOT refresh the timestamp. This lets the route age out when
-                # the real next-hop goes silent (node failure), so we converge
-                # to the alternative path correctly.
-
-    # Install new/updated routes into the kernel OUTSIDE the lock
-    for subnet, via_ip in routes_to_add_to_kernel:
-        kernel_add_route(subnet, via_ip)
-
-    if table_updated:
-        show_current_routing_table()
-
-
-# ==========================================
-# Listen for Incoming Updates
-# ==========================================
-def udp_listener_loop():
-    udp_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_receiver.bind(("0.0.0.0", udp_port_number))
-
-    print(f"[INFO] Listening on UDP port {udp_port_number}")
-
+def recv_loop():
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    rx.bind(("0.0.0.0", svc_udp))
+    print(f"[INFO] Listening on UDP port {svc_udp}")
     while True:
         try:
-            packet_data, sender_address = udp_receiver.recvfrom(4096)
-            sender_ip = sender_address[0]
-            decoded_message = json.loads(packet_data.decode())
-            if decoded_message.get("version") != 1.0:
+            blob, frm = rx.recvfrom(4096)
+            pkt = json.loads(blob.decode())
+            if pkt.get("version") != 1.0:
                 continue
-            received_routes = decoded_message.get("routes", [])
-            process_incoming_routes(sender_ip, received_routes)
-        except Exception as receive_issue:
-            print("[ERROR] Receive issue:", receive_issue)
+            ingest_tlv(frm[0], pkt.get("routes", []))
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            print("[ERROR] Bad packet:", err)
+        except Exception as err:
+            print("[ERROR] Receive issue:", err)
 
-
-# ==========================================
-# Remove Expired Routes
-# ==========================================
-def expired_route_cleanup_worker():
+def sweep_stale():
     while True:
-        current_time_value = time.time()
-        removed_subnets = []
-
-        with table_lock:
-            for subnet_value in list(routing_information_table.keys()):
-                route_info = routing_information_table[subnet_value]
-                distance_metric = route_info[0]
-                last_update_time = route_info[2]
-
-                # Direct routes (cost 0) stay forever
-                if distance_metric == 0:
+        now = time.time()
+        gone = False
+        with mtx_topo:
+            for pfx in list(topo_map.keys()):
+                row = topo_map[pfx]
+                if row[0] == 0:
                     continue
+                if now - row[2] > hold_ttl_s:
+                    print(f"[EXPIRE] Removed stale route {pfx}")
+                    del topo_map[pfx]
+                    drip_bad[pfx] = 3
+                    gone = True
+        if gone:
+            trace_topo()
+            mirror_linux_routes()
+            flood_peers(advance_poison=False)
+        time.sleep(1)
 
-                if current_time_value - last_update_time > route_timeout_limit:
-                    print(f"[EXPIRE] Removed stale route {subnet_value}")
-                    del routing_information_table[subnet_value]
-                    removed_subnets.append(subnet_value)
+def main():
+    global sk_tx
+    print(f"\n[INIT] Router {host_v4} started")
+    bootstrap_prefixes()
+    mirror_linux_routes()
+    trace_topo()
+    sk_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sk_tx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    threading.Thread(target=beacon_loop, daemon=True).start()
+    threading.Thread(target=sweep_stale, daemon=True).start()
+    recv_loop()
 
-        # Remove expired routes from kernel OUTSIDE the lock
-        for subnet in removed_subnets:
-            kernel_del_route(subnet)
-
-        if removed_subnets:
-            show_current_routing_table()
-
-        time.sleep(5)
-
-
-# ==========================================
-# Main
-# ==========================================
 if __name__ == "__main__":
-    print(f"\n[INIT] Router {router_identity_ip} started")
-    show_current_routing_table()
-
-    sender_thread = threading.Thread(target=periodic_update_sender, daemon=True)
-    cleanup_thread = threading.Thread(target=expired_route_cleanup_worker, daemon=True)
-
-    sender_thread.start()
-    cleanup_thread.start()
-
-    udp_listener_loop()
+    main()
